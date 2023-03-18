@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional, Sequence
 
-from yaml import dump, safe_load
+from yaml import dump, safe_dump, safe_load
 
 from dbt_checkpoint.check_script_ref_and_source import check_refs_sources
 from dbt_checkpoint.tracking import dbtCheckpointTracking
@@ -12,40 +12,58 @@ from dbt_checkpoint.utils import JsonOpenError, add_default_args, get_json
 
 
 def create_missing_sources(
-    sources: Dict[FrozenSet[str], Dict[str, str]], output_path: str
+    sources: Dict[FrozenSet[str], Dict[str, str]],
+    output_path: str
 ) -> Dict[str, Any]:
     status_code = 0
     if sources:
-        status_code = 1
+        updated = False
+        path = Path(output_path)
+        # is file and exists
+        if not path.is_file():
+            # create file if it doesn't exist
+            path.touch()
+            print(f"Target schema file not found at `{output_path}`. Created it.")
+
+        schema = safe_load(path.open())
+        schema_sources = schema.get("sources", []) if schema else []
+
         for _, source in sources.items():
             source_name = source.get("source_name")
             table_name = source.get("table_name")
-            path = Path(output_path)
-            # is file and exists
-            if path.is_file():
-                schema = safe_load(path.open())
-                schema_sources = schema.get("sources", [])
-                seen = False  # pragma: no mutate
-                for schema_source in schema_sources:
-                    if schema_source.get("name") == source_name:
-                        seen = True
-                        tables = schema_source.setdefault("tables", [])
-                        tables.append({"name": table_name})
-                if not seen:  # pragma: no mutate
-                    print(
-                        f"Source `{source_name}` does not "
-                        f"exists in `{output_path}`. Please create it "
-                        f"before adding tables."
-                    )
-                with open(path, "w") as f:
-                    print(f"Generating missing source `{source_name}.{table_name}`.")
-                    dump(schema, f, default_flow_style=False, sort_keys=False)
+
+            matching_sources = list(
+                filter(lambda schema_source: schema_source.get("name") == source_name, schema_sources))
+            # check if schema_source exists in schema_sources
+            is_schema_source_already_declared = len(matching_sources) > 0
+
+            # if schema_source does not exist in schema_sources, add it with this new source
+            if not is_schema_source_already_declared:
+                print(f"Adding schema source for `{source_name}.{table_name}`.")
+                source = {"name": source_name, "tables": [{"name": table_name}]}
+                schema_sources.append(source)
+                updated = True
             else:
-                print(
-                    f"Path `{output_path}` does not exists. "
-                    f"Please create this file or change path."
-                )
-                return {"status_code": status_code}
+                # if schema_source exists in schema_sources, add the new source to the existing schema_source
+                for matching_source in matching_sources:
+                    tables = matching_source.setdefault("tables", [])
+                    is_table_already_declared = any(
+                        table.get("name") == table_name for table in tables)
+                    # check if table exists in tables, if so we don't need to add it
+                    if is_table_already_declared:
+                        continue
+                    else:
+                        # if table does not exist in tables, add it
+                        print(
+                            f"Generating missing source `{source_name}.{table_name}`.")
+                        tables.append({"name": table_name})
+                        updated = True
+
+        if updated:
+            # write the updated schema file
+            with open(path, "w") as file:
+                safe_dump(schema, file, default_flow_style=False, sort_keys=False)
+                
 
     return {"status_code": status_code}
 
@@ -62,7 +80,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         be created.
         """,
     )
-
     args = parser.parse_args(argv)
 
     try:
@@ -78,7 +95,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sources = check_refs_sources_properties.get("sources")
 
-    hook_properties = create_missing_sources(sources, output_path=args.schema_file)
+    #print(f"sources: {sources}")
+    print(f"-----------------")
+
+    hook_properties = create_missing_sources(
+        sources, output_path=args.schema_file)
     end_time = time.time()
 
     script_args = vars(args)
